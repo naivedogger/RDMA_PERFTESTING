@@ -187,6 +187,206 @@ char * get_peer_message_region(struct connection *conn)
     return conn->rdma_local_region;
 }
 
+/*******
+ * 
+ * 
+ * 可以在这里加上一些函数
+ * 
+ * 
+ */
+
+void bulky_write(struct connection *conn){
+  struct ibv_send_wr *bad_wr = NULL;
+  const int k = 1; // 每一批次的指令数量
+  struct ibv_send_wr wr[k];
+  struct ibv_sge sg[k];
+  const int rounds = 40 * 1024 * 1024 / RDMA_BUFFER_SIZE;
+  for(int i = 0; i < rounds; i += k){
+    // k = 1 的时候是没有问题的，结果大概是 3w us，但是 k = 16 就不行了
+    // 怀疑：每个wr都要有自己的sge？
+    for(int j = 0; j < k && i < rounds; j++){
+      memset(&sg[j], 0, sizeof(struct ibv_sge));
+      memset(&wr[j], 0, sizeof(struct ibv_send_wr));
+
+      sg[j].addr = (uintptr_t)conn->rdma_local_region;
+      sg[j].length = RDMA_BUFFER_SIZE;
+      sg[j].lkey = conn->rdma_local_mr->lkey;
+
+      wr[j].next = (j == k - 1 || i == rounds - 1) ? NULL : &wr[j + 1];
+      wr[j].wr_id = (uintptr_t)conn;
+      wr[j].opcode = IBV_WR_RDMA_WRITE;
+      wr[j].sg_list = &sg[j];
+      wr[j].num_sge = 1;
+      // 发现好像是这里的标志设置的不对
+      if(j == k - 1)
+        wr[j].send_flags = IBV_SEND_SIGNALED;
+      wr[j].wr.rdma.remote_addr = (uintptr_t)conn->peer_mr.addr;
+      wr[j].wr.rdma.rkey = conn->peer_mr.rkey;
+    }
+    //需要研究一下怎么把这个弄成一个batch，每次只发一条、poll一条还是太慢了，而且还会报错
+    //这样的时间大致是0.46s
+    // 妈的这里返回值12代表什么啊
+    int rc = ibv_post_send(conn->qp, &wr[0], &bad_wr);
+    struct ibv_wc wc;
+    //这个cq应该不是通过channel获得的吧。。。
+    //channel的cq应该是建立连接的时候用的，我估计得自己搞一个，因为它原来的代码没有poll
+    //但是创建qp的时候是给了这个cq的，按理来说没问题呀
+    //printf("rc = %d\n",rc);
+    assert(rc == 0);
+    int new_cnt = 0, cnt = 0;
+    // 加上这一行也没啥用，难道说不是CQ的问题吗
+    struct ibv_cq *cq = NULL;
+    cq = conn->qp->send_cq;
+    do {
+      // 如果不需要sync的话，那就不 poll_cq
+      new_cnt = ibv_poll_cq(cq,1,&wc);
+      cnt += new_cnt;
+      if (new_cnt < 0) {
+        printf("Failed to poll completions from the CQ\n");
+        exit(-1);
+      }
+      if(new_cnt == 0)
+        continue;
+      if(wc.status != IBV_WC_SUCCESS){
+        exit(-1);
+      }
+    } while(cnt < 1);
+    assert(wc.status == IBV_WC_SUCCESS);
+  }
+}
+
+void read_kv(struct connection *conn){
+  const int cas_rounds = 163840;
+  struct ibv_send_wr *bad_wr = NULL;
+  const int k = 1; // 每一批次的指令数量
+  struct ibv_send_wr wr[k];
+  struct ibv_sge sg[k];
+  for(int i = 0; i < cas_rounds; i += k){
+      // 每一轮实际上是一次sync读+一次CAS
+      for(int j = 0; j < k && i < cas_rounds; j++){
+        memset(&sg[j], 0, sizeof(struct ibv_sge));
+        memset(&wr[j], 0, sizeof(struct ibv_send_wr));
+
+        sg[j].addr = (uintptr_t)conn->rdma_local_region;
+        sg[j].length = 256; // 先算kv块的大小是256字节
+        sg[j].lkey = conn->rdma_local_mr->lkey;
+
+        wr[j].next = (j == k - 1 || i == cas_rounds - 1) ? NULL : &wr[j + 1];
+        wr[j].wr_id = (uintptr_t)conn;
+        // 为啥write可以，read就不行了
+        // 尼玛真逆天，要么只能写要么只能读
+        // 实测如果命令行给read，那么就可以
+        wr[j].opcode = IBV_WR_RDMA_READ; 
+        wr[j].sg_list = &sg[j];
+        wr[j].num_sge = 1;
+        // 发现好像是这里的标志设置的不对
+        if(j == k - 1)
+          wr[j].send_flags = IBV_SEND_SIGNALED;
+        wr[j].wr.rdma.remote_addr = (uintptr_t)conn->peer_mr.addr;
+        wr[j].wr.rdma.rkey = conn->peer_mr.rkey;
+      }
+      //需要研究一下怎么把这个弄成一个batch，每次只发一条、poll一条还是太慢了，而且还会报错
+      //这样的时间大致是0.46s
+      // 妈的这里返回值12代表什么啊
+      int rc = ibv_post_send(conn->qp, &wr[0], &bad_wr);
+      struct ibv_wc wc;
+      //这个cq应该不是通过channel获得的吧。。。
+      //channel的cq应该是建立连接的时候用的，我估计得自己搞一个，因为它原来的代码没有poll
+      //但是创建qp的时候是给了这个cq的，按理来说没问题呀
+      //printf("rc = %d\n",rc);
+      assert(rc == 0);
+      int new_cnt = 0, cnt = 0;
+      // 加上这一行也没啥用，难道说不是CQ的问题吗
+      struct ibv_cq *cq = NULL;
+      cq = conn->qp->send_cq;
+      do {
+
+        new_cnt = ibv_poll_cq(cq,1,&wc);
+        cnt += new_cnt;
+        if (new_cnt < 0) {
+          printf("Failed to poll completions from the CQ\n");
+          exit(-1);
+        }
+        if(new_cnt == 0)
+          continue;
+        if(wc.status != IBV_WC_SUCCESS){
+          exit(-1);
+        }
+      } while(cnt < 1);
+      assert(wc.status == IBV_WC_SUCCESS);
+    }
+}
+
+void compare_and_swap(struct connection *conn){ // 先用粒度小一些的read模拟吧，实际上cas和read的吞吐率在没有冲突的情况下是差不多的
+  const int cas_rounds = 1000000;
+  struct ibv_send_wr *bad_wr = NULL;
+  const int k = 1; // 每一批次的指令数量
+  struct ibv_send_wr wr[k];
+  struct ibv_sge sg[k];
+  for(int i = 0; i < cas_rounds; i += k){
+      // 每一轮实际上是一次sync读+一次CAS
+      for(int j = 0; j < k && i < cas_rounds; j++){
+        memset(&sg[j], 0, sizeof(struct ibv_sge));
+        memset(&wr[j], 0, sizeof(struct ibv_send_wr));
+
+        sg[j].addr = (uintptr_t)conn->rdma_local_region;
+        sg[j].length = 8; // 先算kv块的大小是256字节
+        sg[j].lkey = conn->rdma_local_mr->lkey;
+
+        wr[j].next = (j == k - 1 || i == cas_rounds - 1) ? NULL : &wr[j + 1];
+        wr[j].wr_id = (uintptr_t)conn;
+        // 为啥write可以，read就不行了
+        // 尼玛真逆天，要么只能写要么只能读
+        // 实测如果命令行给read，那么就可以
+        wr[j].opcode = IBV_WR_RDMA_READ; 
+        wr[j].sg_list = &sg[j];
+        wr[j].num_sge = 1;
+        // 发现好像是这里的标志设置的不对
+        if(j == k - 1)
+          wr[j].send_flags = IBV_SEND_SIGNALED;
+        wr[j].wr.rdma.remote_addr = (uintptr_t)conn->peer_mr.addr;
+        wr[j].wr.rdma.rkey = conn->peer_mr.rkey;
+      }
+      //需要研究一下怎么把这个弄成一个batch，每次只发一条、poll一条还是太慢了，而且还会报错
+      //这样的时间大致是0.46s
+      // 妈的这里返回值12代表什么啊
+      int rc = ibv_post_send(conn->qp, &wr[0], &bad_wr);
+      struct ibv_wc wc;
+      //这个cq应该不是通过channel获得的吧。。。
+      //channel的cq应该是建立连接的时候用的，我估计得自己搞一个，因为它原来的代码没有poll
+      //但是创建qp的时候是给了这个cq的，按理来说没问题呀
+      //printf("rc = %d\n",rc);
+      assert(rc == 0);
+      int new_cnt = 0, cnt = 0;
+      // 加上这一行也没啥用，难道说不是CQ的问题吗
+      struct ibv_cq *cq = NULL;
+      cq = conn->qp->send_cq;
+      do {
+
+        new_cnt = ibv_poll_cq(cq,1,&wc);
+        cnt += new_cnt;
+        if (new_cnt < 0) {
+          printf("Failed to poll completions from the CQ\n");
+          exit(-1);
+        }
+        if(new_cnt == 0)
+          continue;
+        if(wc.status != IBV_WC_SUCCESS){
+          exit(-1);
+        }
+      } while(cnt < 1);
+      assert(wc.status == IBV_WC_SUCCESS);
+    }
+}
+
+/*****
+ * 
+ * 
+ * 其他的不要修改
+ * 
+ * 
+ */
+
 void on_completion(struct ibv_wc *wc)
 {
   struct connection *conn = (struct connection *)(uintptr_t)wc->wr_id;
@@ -212,9 +412,6 @@ void on_completion(struct ibv_wc *wc)
 
   //这个地方直接写死了，想办法自己写个函数来处理，同时令poll_cq成功一次就退出
   if (conn->send_state == SS_MR_SENT && conn->recv_state == RS_MR_RECV) {
-    //struct ibv_send_wr wr, 
-    struct ibv_send_wr *bad_wr = NULL;
-    // struct ibv_sge sge;
 
     if (s_mode == M_WRITE)
       printf("received MSG_MR. writing message to remote memory...\n");
@@ -223,118 +420,66 @@ void on_completion(struct ibv_wc *wc)
 
     //memset(&wr, 0, sizeof(wr));
 
+/************************************************ 
+ * 
+ * 
+ * 
+ * 
+ * 从这里开始修改
+ * 
+ * 
+ * 
+ * 
+*/
+
 //GALA:就是要修改这个函数，把它变成想要的
 //后台有一个线程一直poll，所以不用担心这个
 //但是也有个问题，那就是如果需要sync的话，看下怎么处理
 //搜索poll_cq，把后台的停掉，前台调用这个函数
 
-    // wr.wr_id = (uintptr_t)conn;
-    // wr.opcode = (s_mode == M_WRITE) ? IBV_WR_RDMA_WRITE : IBV_WR_RDMA_READ;
-    // wr.sg_list = &sge;
-    // wr.num_sge = 1;
-    // wr.send_flags = IBV_SEND_SIGNALED;
-    // wr.wr.rdma.remote_addr = (uintptr_t)conn->peer_mr.addr;
-    // wr.wr.rdma.rkey = conn->peer_mr.rkey;
-
     // bulky write， 10K 轮
     struct timeval start, end;
     gettimeofday(&start, NULL);
-    // int j = 0;
-    struct ibv_cq *cq = NULL;
-    void *ctx = NULL;
-    TEST_NZ(ibv_get_cq_event(s_ctx->comp_channel, &cq, &ctx));
-    ibv_ack_cq_events(cq, 1);
-    TEST_NZ(ibv_req_notify_cq(cq, 0));
-    const int k = 1;
-    struct ibv_send_wr wr[k];
-    struct ibv_sge sg[k];
-    const int rounds = 40 * 1024 * 1024 / RDMA_BUFFER_SIZE;
-    for(int i = 0; i < rounds; ){
-      // k = 1 的时候是没有问题的，结果大概是 3w us，但是 k = 16 就不行了
-      // 怀疑：每个wr都要有自己的sge？
-      for(int j = 0; j < k && i < rounds; j++){
-        memset(&sg[j], 0, sizeof(struct ibv_sge));
-        memset(&wr[j], 0, sizeof(struct ibv_send_wr));
 
-        sg[j].addr = (uintptr_t)conn->rdma_local_region;
-        sg[j].length = RDMA_BUFFER_SIZE;
-        sg[j].lkey = conn->rdma_local_mr->lkey;
-
-        wr[j].next = (j == k - 1 || i == rounds - 1) ? NULL : &wr[j + 1];
-        wr[j].wr_id = (uintptr_t)conn;
-        wr[j].opcode = (s_mode == M_WRITE) ? IBV_WR_RDMA_WRITE : IBV_WR_RDMA_READ;
-        wr[j].sg_list = &sg[j];
-        wr[j].num_sge = 1;
-        // 发现好像是这里的标志设置的不对
-        if(j == k - 1)
-          wr[j].send_flags = IBV_SEND_SIGNALED;
-        wr[j].wr.rdma.remote_addr = (uintptr_t)conn->peer_mr.addr;
-        wr[j].wr.rdma.rkey = conn->peer_mr.rkey;
-        i ++;
-      }
-      //需要研究一下怎么把这个弄成一个batch，每次只发一条、poll一条还是太慢了，而且还会报错
-      //这样的时间大致是0.46s
-      // 妈的这里返回值12代表什么啊
-      int rc = ibv_post_send(conn->qp, &wr[0], &bad_wr);
-      struct ibv_wc wc;
-      //这个cq应该不是通过channel获得的吧。。。
-      //channel的cq应该是建立连接的时候用的，我估计得自己搞一个，因为它原来的代码没有poll
-      //但是创建qp的时候是给了这个cq的，按理来说没问题呀
-      printf("rc = %d\n",rc);
-      assert(rc == 0);
-      int new_cnt = 0, cnt = 0;
-      // 加上这一行也没啥用，难道说不是CQ的问题吗
-      cq = conn->qp->send_cq;
-      do {
-
-        new_cnt = ibv_poll_cq(cq,1,&wc);
-        cnt += new_cnt;
-        if (new_cnt < 0) {
-          printf("Failed to poll completions from the CQ\n");
-          exit(-1);
-        }
-        if(new_cnt == 0)
-          continue;
-        if(wc.status != IBV_WC_SUCCESS){
-          exit(-1);
-        }
-        //printf("cq_cnt: %d\n",new_cnt);
-
-        // while (ibv_poll_cq(cq, 1, &wc)){
-        //   f = 0;
-        //   //on_completion(&wc);
-        //   //return NULL;
-        // }
-      } while(cnt < 1);
-      assert(wc.status == IBV_WC_SUCCESS);
-      // if(j ++ >= 1){
-      //   while(j > 0)
-      //   // while(poll_cq_no_recursive(NULL) && j > 0){
-      //   //   j --;
-      //   // }
-      //   // j -= poll_cq_no_recursive(NULL);
-      //   // struct ibv_cq *cq;
-      //   // struct ibv_wc wc;
-      //   // void *ctx = NULL;
-        
-      //   // int ne;
-      //   // do{
-      //   //   TEST_NZ(ibv_get_cq_event(s_ctx->comp_channel, &cq, &ctx));
-      //   //   ibv_ack_cq_events(cq, 1);
-      //   //   TEST_NZ(ibv_req_notify_cq(cq, 0));
-      //   //   ne = ibv_poll_cq(cq,1,&wc);
-      //   // }
-      //   // while(ne > 0);
-      //   // j = 0;
-      // }
-    }
+    bulky_write(conn);
+    
     gettimeofday(&end,NULL);
     long dur = 1000000 * (end.tv_sec - start.tv_sec) + end.tv_usec - start.tv_usec;
     printf("bulky write took %ld us.\n", dur);
-    // int cnt = 0;
-    // while(poll_cq_no_recursive(NULL) && cnt <= 0)
-    //   cnt ++;
 
+    //
+    //
+    // READ KVs
+    gettimeofday(&start, NULL);
+
+    read_kv(conn); // 目前只实现了sync read，实际上如果假设每次cas都成功的话，那么需要的时间应该也是差不多的
+    
+    gettimeofday(&end,NULL);
+    dur = 1000000 * (end.tv_sec - start.tv_sec) + end.tv_usec - start.tv_usec;
+    printf("READ kvs took %ld us.\n", dur);
+
+    //
+    //
+    // CAS 100w 次
+    gettimeofday(&start, NULL);
+
+    compare_and_swap(conn); // 目前只实现了sync read，实际上如果假设每次cas都成功的话，那么需要的时间应该也是差不多的
+    
+    gettimeofday(&end,NULL);
+    dur = 1000000 * (end.tv_sec - start.tv_sec) + end.tv_usec - start.tv_usec;
+    printf("CAS took %ld us.\n", dur);
+
+/************************************************ 
+ * 
+ * 
+ * 
+ * 
+ * 修改结束
+ * 
+ * 
+ * 
+ * 
+*/
 
     conn->send_msg->type = MSG_DONE;
     send_message(conn);
@@ -431,7 +576,8 @@ void register_memory(struct connection *conn)
     s_ctx->pd, 
     conn->recv_msg, 
     sizeof(struct message), 
-    IBV_ACCESS_LOCAL_WRITE | ((s_mode == M_WRITE) ? IBV_ACCESS_REMOTE_WRITE : IBV_ACCESS_REMOTE_READ)));
+    // IBV_ACCESS_LOCAL_WRITE | ((s_mode == M_WRITE) ? IBV_ACCESS_REMOTE_WRITE : IBV_ACCESS_REMOTE_READ)));
+    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ));
 
   TEST_Z(conn->rdma_local_mr = ibv_reg_mr(
     s_ctx->pd, 
@@ -443,7 +589,8 @@ void register_memory(struct connection *conn)
     s_ctx->pd, 
     conn->rdma_remote_region, 
     RDMA_BUFFER_SIZE, 
-    IBV_ACCESS_LOCAL_WRITE | ((s_mode == M_WRITE) ? IBV_ACCESS_REMOTE_WRITE : IBV_ACCESS_REMOTE_READ)));
+    // IBV_ACCESS_LOCAL_WRITE | ((s_mode == M_WRITE) ? IBV_ACCESS_REMOTE_WRITE : IBV_ACCESS_REMOTE_READ)));
+    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ));
 }
 
 void send_message(struct connection *conn)
